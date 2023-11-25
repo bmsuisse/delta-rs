@@ -10,6 +10,7 @@ use lazy_static::lazy_static;
 use object_store::{path::Path, Error as ObjectStoreError, ObjectStore};
 use serde::{Deserialize, Serialize};
 
+use super::config::ColumnMappingMode;
 use super::config::TableConfig;
 use crate::errors::DeltaTableError;
 use crate::kernel::{
@@ -397,6 +398,7 @@ impl DeltaTableState {
         filters: &'a [PartitionFilter],
     ) -> Result<impl Iterator<Item = &Add> + '_, DeltaTableError> {
         let current_metadata = self.current_metadata().ok_or(DeltaTableError::NoMetadata)?;
+        let column_mapping_mode = self.table_config().column_mapping_mode();
 
         let nonpartitioned_columns: Vec<String> = filters
             .iter()
@@ -414,12 +416,37 @@ impl DeltaTableState {
             .get_partition_col_data_types()
             .into_iter()
             .collect();
-
+        
+        let physical_name_to_logical_name = match column_mapping_mode {
+            ColumnMappingMode::None => HashMap::with_capacity(0), // No column mapping, no need for this HashMap
+            ColumnMappingMode::Id | ColumnMappingMode::Name => current_metadata
+                .partition_columns
+                .iter()
+                .map(|name| -> Result<_, DeltaTableError> {
+                    let physical_name = current_metadata
+                        .schema
+                        .field_with_name(name)
+                        .or(Err(DeltaTableError::MetadataError(format!(
+                            "Invalid partition column {0}",
+                            name
+                        ))))?
+                        .physical_name()
+                        .map_err(|e| DeltaTableError::Kernel { source: e })?;
+                    Ok((physical_name, name.as_str()))
+                })
+                .collect::<Result<HashMap<&str, &str>, DeltaTableError>>()?,
+        };
         let actions = self.files().iter().filter(move |add| {
             let partitions = add
                 .partition_values
                 .iter()
-                .map(|p| DeltaTablePartition::from_partition_value((p.0, p.1), ""))
+                .map(|p| DeltaTablePartition::from_partition_value((
+                    match column_mapping_mode {
+                        ColumnMappingMode::None => p.0,
+                        ColumnMappingMode::Id | ColumnMappingMode::Name => {
+                            physical_name_to_logical_name.get(p.0.as_str()).unwrap()
+                        }
+                    }, p.1), ""))
                 .collect::<Vec<DeltaTablePartition>>();
             filters
                 .iter()

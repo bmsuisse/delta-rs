@@ -1174,6 +1174,21 @@ mod tests {
             assert_eq!(expected, actions);
         }
 
+        
+
+        #[tokio::test]
+        async fn test_files_with_column_mapping() {
+            // test table with column mapping and partitions
+            let path = "./tests/data/table_with_column_mapping";
+            let table = crate::open_table(path).await.unwrap();
+            let files = table.get_files_by_partitions(&[crate::PartitionFilter {
+                       key: "Company Very Short".to_string(),
+                       value: crate::PartitionValue::Equal("BME".to_string()),
+                   }]).unwrap();
+            assert_eq!(files.len(), 1);
+            assert_eq!(files[0].to_string(), "8v/part-00001-69b4a452-aeac-4ffa-bf5c-a0c2833d05eb.c000.zstd.parquet");
+        }
+
         #[tokio::test]
         async fn test_with_stats() {
             // test table with stats
