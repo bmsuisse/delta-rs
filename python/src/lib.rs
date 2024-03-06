@@ -1389,6 +1389,7 @@ impl From<&PyAddAction> for Add {
 fn write_to_deltalake(
     table_uri: String,
     data: PyArrowType<ArrowArrayStreamReader>,
+    schema: PyArrowType<ArrowSchema>,
     mode: String,
     max_rows_per_group: i64,
     schema_mode: Option<String>,
@@ -1400,8 +1401,9 @@ fn write_to_deltalake(
     storage_options: Option<HashMap<String, String>>,
     writer_properties: Option<HashMap<String, Option<String>>>,
     custom_metadata: Option<HashMap<String, String>>,
+    
 ) -> PyResult<()> {
-    let batches = data.0.map(|batch| batch.unwrap()).collect::<Vec<_>>();
+    let batches = data.0.map(|batch| batch.unwrap());
     let save_mode = mode.parse().map_err(PythonError::from)?;
 
     let options = storage_options.clone().unwrap_or_default();
@@ -1413,6 +1415,7 @@ fn write_to_deltalake(
 
     let mut builder = table
         .write(batches)
+        .with_schema(schema)
         .with_save_mode(save_mode)
         .with_write_batch_size(max_rows_per_group as usize);
     if let Some(schema_mode) = schema_mode {

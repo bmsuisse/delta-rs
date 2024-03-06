@@ -36,6 +36,7 @@ use arrow_schema::{ArrowError, DataType, Fields, SchemaRef as ArrowSchemaRef};
 use datafusion::execution::context::{SessionContext, SessionState, TaskContext};
 use datafusion::physical_expr::create_physical_expr;
 use datafusion::physical_plan::filter::FilterExec;
+use datafusion::physical_plan::stream::RecordBatchReceiverStreamBuilder;
 use datafusion::physical_plan::{memory::MemoryExec, ExecutionPlan};
 use datafusion_common::DFSchema;
 use datafusion_expr::Expr;
@@ -66,6 +67,9 @@ use crate::DeltaTable;
 enum WriteError {
     #[error("No data source supplied to write command.")]
     MissingData,
+
+    #[error("No schema supplied to write command.")]
+    MissingSchema,
 
     #[error("Failed to execute write task: {source}")]
     WriteTask { source: tokio::task::JoinError },
@@ -135,7 +139,9 @@ pub struct WriteBuilder {
     /// Number of records to be written in single batch to underlying writer
     write_batch_size: Option<usize>,
     /// RecordBatches to be written into the table
-    batches: Option<Vec<RecordBatch>>,
+    batches: Option<Box<dyn Iterator<Item = RecordBatch>>>,
+    /// The schema of the input record batches
+    schema: Option<ArrowSchemaRef>,
     /// whether to overwrite the schema or to merge it. None means to fail on schmema drift
     schema_mode: Option<SchemaMode>,
     /// how to handle cast failures, either return NULL (safe=true) or return ERR (safe=false)
@@ -168,6 +174,7 @@ impl WriteBuilder {
             batches: None,
             safe_cast: false,
             schema_mode: None,
+            schema: None,
             writer_properties: None,
             app_metadata: None,
             name: None,
@@ -218,7 +225,12 @@ impl WriteBuilder {
 
     /// Execution plan that produces the data to be written to the delta table
     pub fn with_input_batches(mut self, batches: impl IntoIterator<Item = RecordBatch>) -> Self {
-        self.batches = Some(batches.into_iter().collect());
+        self.batches = Some(Box::new(batches.into_iter()));
+        self
+    }
+
+    pub fn with_schema(mut self, schema: ArrowSchemaRef) -> Self {
+        self.schema = Some(schema);
         self
     }
 
@@ -289,9 +301,11 @@ impl WriteBuilder {
                 if let Some(plan) = &self.input {
                     let schema: StructType = (plan.schema()).try_into()?;
                     PROTOCOL.check_can_write_timestamp_ntz(snapshot, &schema)?;
-                } else if let Some(batches) = &self.batches {
-                    let schema: StructType = (batches[0].schema()).try_into()?;
+                } else if let Some(schema) = &self.schema {
+                    let schema: StructType = schema.as_ref().try_into()?;
                     PROTOCOL.check_can_write_timestamp_ntz(snapshot, &schema)?;
+                } else {
+                    return Err(WriteError::MissingSchema.into());
                 }
 
                 match self.mode {
@@ -304,13 +318,10 @@ impl WriteBuilder {
             None => {
                 let schema: StructType = if let Some(plan) = &self.input {
                     Ok(plan.schema().try_into()?)
-                } else if let Some(batches) = &self.batches {
-                    if batches.is_empty() {
-                        return Err(WriteError::MissingData.into());
-                    }
-                    Ok(batches[0].schema().try_into()?)
+                } else if let Some(schema) = &self.schema {
+                    Ok(schema.as_ref().try_into()?)
                 } else {
-                    Err(WriteError::MissingData)
+                    Err(WriteError::MissingSchema)
                 }?;
                 let mut builder = CreateBuilder::new()
                     .with_log_store(self.log_store.clone())
@@ -603,88 +614,86 @@ impl std::future::IntoFuture for WriteBuilder {
                 }
                 Ok(plan)
             } else if let Some(batches) = this.batches {
-                if batches.is_empty() {
-                    Err(WriteError::MissingData)
-                } else {
-                    let schema = batches[0].schema();
+                match this.schema {
+                    None => Err(WriteError::MissingData),
+                    Some(schema) => {
+                        let mut new_schema = None;
+                        if let Some(snapshot) = &this.snapshot {
+                            let table_schema = snapshot
+                                .physical_arrow_schema(this.log_store.object_store().clone())
+                                .await
+                                .or_else(|_| snapshot.arrow_schema())
+                                .unwrap_or(schema.clone());
 
-                    let mut new_schema = None;
-                    if let Some(snapshot) = &this.snapshot {
-                        let table_schema = snapshot
-                            .physical_arrow_schema(this.log_store.object_store().clone())
-                            .await
-                            .or_else(|_| snapshot.arrow_schema())
-                            .unwrap_or(schema.clone());
-
-                        if let Err(schema_err) =
-                            try_cast_batch(schema.fields(), table_schema.fields())
-                        {
-                            schema_drift = true;
-                            if this.mode == SaveMode::Overwrite && this.schema_mode.is_some() {
-                                new_schema = None // we overwrite anyway, so no need to cast
-                            } else if this.schema_mode == Some(SchemaMode::Merge) {
-                                new_schema = Some(Arc::new(merge_schema(
-                                    table_schema.as_ref().clone(),
-                                    schema.as_ref().clone(),
-                                )?));
-                            } else {
-                                return Err(schema_err.into());
+                            if let Err(schema_err) =
+                                try_cast_batch(schema.fields(), table_schema.fields())
+                            {
+                                schema_drift = true;
+                                if this.mode == SaveMode::Overwrite && this.schema_mode.is_some() {
+                                    new_schema = None // we overwrite anyway, so no need to cast
+                                } else if this.schema_mode == Some(SchemaMode::Merge) {
+                                    new_schema = Some(Arc::new(merge_schema(
+                                        table_schema.as_ref().clone(),
+                                        schema.as_ref().clone(),
+                                    )?));
+                                } else {
+                                    return Err(schema_err.into());
+                                }
                             }
                         }
+                        // TODO: create a MemoryExec that can live with an iterator
+                        let data = if !partition_columns.is_empty() {
+                            // TODO partitioning should probably happen in its own plan ...
+                            let mut partitions: HashMap<String, Vec<RecordBatch>> = HashMap::new();
+                            for batch in batches {
+                                let real_batch = match new_schema.clone() {
+                                    Some(new_schema) => {
+                                        cast_record_batch(&batch, new_schema, false, true)?
+                                    }
+                                    None => batch,
+                                };
+
+                                let divided = divide_by_partition_values(
+                                    new_schema.clone().unwrap_or(schema.clone()),
+                                    partition_columns.clone(),
+                                    &real_batch,
+                                )?;
+                                for part in divided {
+                                    let key = part.partition_values.hive_partition_path();
+                                    match partitions.get_mut(&key) {
+                                        Some(part_batches) => {
+                                            part_batches.push(part.record_batch);
+                                        }
+                                        None => {
+                                            partitions.insert(key, vec![part.record_batch]);
+                                        }
+                                    }
+                                }
+                            }
+                            partitions.into_values().collect::<Vec<_>>()
+                        } else {
+                            match new_schema {
+                                Some(ref new_schema) => {
+                                    let mut new_batches = vec![];
+                                    for batch in batches {
+                                        new_batches.push(cast_record_batch(
+                                            &batch,
+                                            new_schema.clone(),
+                                            false,
+                                            true,
+                                        )?);
+                                    }
+                                    vec![new_batches]
+                                }
+                                None => vec![batches],
+                            }
+                        };
+                        Ok(Arc::new(MemoryExec::try_new(
+                            &data,
+                            new_schema.unwrap_or(schema).clone(),
+                            None,
+                        )?) as Arc<dyn ExecutionPlan>)
                     }
-
-                    let data = if !partition_columns.is_empty() {
-                        // TODO partitioning should probably happen in its own plan ...
-                        let mut partitions: HashMap<String, Vec<RecordBatch>> = HashMap::new();
-                        for batch in batches {
-                            let real_batch = match new_schema.clone() {
-                                Some(new_schema) => {
-                                    cast_record_batch(&batch, new_schema, false, true)?
-                                }
-                                None => batch,
-                            };
-
-                            let divided = divide_by_partition_values(
-                                new_schema.clone().unwrap_or(schema.clone()),
-                                partition_columns.clone(),
-                                &real_batch,
-                            )?;
-                            for part in divided {
-                                let key = part.partition_values.hive_partition_path();
-                                match partitions.get_mut(&key) {
-                                    Some(part_batches) => {
-                                        part_batches.push(part.record_batch);
-                                    }
-                                    None => {
-                                        partitions.insert(key, vec![part.record_batch]);
-                                    }
-                                }
-                            }
-                        }
-                        partitions.into_values().collect::<Vec<_>>()
-                    } else {
-                        match new_schema {
-                            Some(ref new_schema) => {
-                                let mut new_batches = vec![];
-                                for batch in batches {
-                                    new_batches.push(cast_record_batch(
-                                        &batch,
-                                        new_schema.clone(),
-                                        false,
-                                        true,
-                                    )?);
-                                }
-                                vec![new_batches]
-                            }
-                            None => vec![batches],
-                        }
-                    };
-
-                    Ok(Arc::new(MemoryExec::try_new(
-                        &data,
-                        new_schema.unwrap_or(schema).clone(),
-                        None,
-                    )?) as Arc<dyn ExecutionPlan>)
                 }
             } else {
                 Err(WriteError::MissingData)
