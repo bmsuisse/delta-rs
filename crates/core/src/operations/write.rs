@@ -37,12 +37,12 @@ use datafusion::execution::context::{SessionContext, SessionState, TaskContext};
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream};
 use datafusion::physical_expr::create_physical_expr;
 use datafusion::physical_plan::filter::FilterExec;
-use datafusion::physical_plan::stream::RecordBatchReceiverStreamBuilder;
+use datafusion::physical_plan::stream::{RecordBatchReceiverStreamBuilder, RecordBatchStreamAdapter};
 use datafusion::physical_plan::{memory::MemoryExec, ExecutionPlan};
 use datafusion_common::DFSchema;
 use datafusion_expr::Expr;
 use futures::future::BoxFuture;
-use futures::StreamExt;
+use futures::{Stream, StreamExt};
 use parquet::file::properties::WriterProperties;
 
 use super::datafusion_utils::Expression;
@@ -140,7 +140,7 @@ pub struct WriteBuilder {
     /// Number of records to be written in single batch to underlying writer
     write_batch_size: Option<usize>,
     /// RecordBatches to be written into the table
-    batches: Option<Box<dyn Iterator<Item = RecordBatch>>>,
+    batches: Option<Box<dyn Iterator<Item = RecordBatch> + Send>>,
     /// The schema of the input record batches
     schema: Option<ArrowSchemaRef>,
     /// whether to overwrite the schema or to merge it. None means to fail on schmema drift
@@ -225,8 +225,8 @@ impl WriteBuilder {
     }
 
     /// Execution plan that produces the data to be written to the delta table
-    pub fn with_input_batches(mut self, batches: impl IntoIterator<Item = RecordBatch>) -> Self {
-        self.batches = Some(Box::new(batches.into_iter()));
+    pub fn with_input_batches<I: Iterator<Item = RecordBatch> + Send>(mut self, batches: I)-> Self {
+        self.batches = Some(Box::new(batches));
         self
     }
 
@@ -487,13 +487,7 @@ async fn execute_non_empty_expr(
     )?;
     let filter: Arc<dyn ExecutionPlan> =
         Arc::new(FilterExec::try_new(predicate_expr, scan.clone())?);
-    let to_execute :Vec<SendableRecordBatchStream> = Vec::with_capacity(partition_columns.len());
-    for i in 0..partition_columns.len() {
-        let res = filter.execute(0, Arc::new(TaskContext::from(&state)))?;
-        to_execute.push(res);
-    }
-    
-     ;
+    let to_execute = plan_to_stream(filter, state)?;
     // We don't want to verify the predicate against existing data
     let add_actions = write_execution_plan(
         Some(snapshot),
@@ -509,6 +503,55 @@ async fn execute_non_empty_expr(
     .await?;
 
     Ok(add_actions)
+}
+
+fn plan_to_stream(plan: Arc<dyn ExecutionPlan>, state: SessionState) -> Result<Vec<SendableRecordBatchStream>, DeltaTableError> {
+    let mut to_execute :Vec<SendableRecordBatchStream> = Vec::with_capacity(plan.output_partitioning().partition_count());
+    for i in 0..plan.output_partitioning().partition_count() {
+        let res = plan.execute(0, Arc::new(TaskContext::from(&state)))?;
+        to_execute.push(res);
+    }
+
+     ;
+    Ok(to_execute)
+}
+
+struct SyncRecordBatchStream {
+    data: Box<dyn Iterator<Item = RecordBatch> + Send>,
+}
+impl Stream for SyncRecordBatchStream {
+    type Item = datafusion_common::Result<RecordBatch>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        std::task::Poll::Ready(self.data.next().map(Ok))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (0, None)
+    }
+}
+
+fn batches_to_stream(batches: Box<dyn Iterator<Item = RecordBatch> + Send>, schema: ArrowSchemaRef, partition_columns: Vec<String>) -> Result<Vec<SendableRecordBatchStream>, DeltaTableError> {
+    let mut to_execute :Vec<SendableRecordBatchStream> = Vec::with_capacity(std::cmp::max(1, partition_columns.len()));
+    if partition_columns.is_empty() {
+        let stream = RecordBatchStreamAdapter::new(schema.clone(), SyncRecordBatchStream {
+            data: batches
+        });
+        to_execute.push(Box::pin(stream));
+    } else {
+        let channels = (0..partition_columns).map(|_| futures::channel::mpsc::channel(10 )).collect::<Vec<_>>();
+        let mut partitioned_batches = divide_by_partition_values(batches, &partition_columns, &schema)?;
+        for (partition_values, batch) in partitioned_batches {
+            let stream = SyncRecordBatchStream {
+                data: Box::new(std::iter::once(batch))
+            };
+            to_execute.push(Box::new(stream));
+        }
+    }
+    Ok(to_execute)
 }
 
 // This should only be called wth a valid predicate
@@ -635,71 +678,32 @@ impl std::future::IntoFuture for WriteBuilder {
                     return Err(schema_err.into());
                 }
             }
-
-            let plan = if let Some(plan) = this.input {
-                Ok(plan)
+            
+            let state = match this.state {
+                Some(state) => state,
+                None => {
+                    let ctx = SessionContext::new();
+                    register_store(this.log_store.clone(), ctx.runtime_env());
+                    ctx.state()
+                }
+            };
+            let base_stream = if let Some(plan) = this.input {
+                
+                plan_to_stream(plan, state)?
             } else if let Some(batches) = this.batches {
-                match this.schema {
-                    None => Err(WriteError::MissingData),
-                    Some(schema) => {
-                        
-                        // TODO: create a MemoryExec that can live with an iterator
-                        let data = if !partition_columns.is_empty() {
-                            // TODO partitioning should probably happen in its own plan ...
-                            let mut partitions: HashMap<String, Vec<RecordBatch>> = HashMap::new();
-                            for batch in batches {
-                                let real_batch = match write_new_schema {
-                                    Some(new_schema) => {
-                                        cast_record_batch(&batch, target_schema, false, true)?
-                                    }
-                                    None => batch,
-                                };
 
-                                let divided = divide_by_partition_values(
-                                    target_schema.clone(),
-                                    partition_columns.clone(),
-                                    &real_batch,
-                                )?;
-                                for part in divided {
-                                    let key = part.partition_values.hive_partition_path();
-                                    match partitions.get_mut(&key) {
-                                        Some(part_batches) => {
-                                            part_batches.push(part.record_batch);
-                                        }
-                                        None => {
-                                            partitions.insert(key, vec![part.record_batch]);
-                                        }
-                                    }
-                                }
-                            }
-                            partitions.into_values().collect::<Vec<_>>()
-                        } else {
-                            match new_schema {
-                                Some(ref new_schema) => {
-                                    let mut new_batches = vec![];
-                                    for batch in batches {
-                                        new_batches.push(cast_record_batch(
-                                            &batch,
-                                            new_schema.clone(),
-                                            false,
-                                            true,
-                                        )?);
-                                    }
-                                    vec![new_batches]
-                                }
-                                None => vec![batches],
-                            }
-                        };
-                        Ok(Arc::new(MemoryExec::try_new(
-                            &data,
-                            new_schema.unwrap_or(schema).clone(),
-                            None,
-                        )?) as Arc<dyn ExecutionPlan>)
+                match this.schema {
+                    None => Err(WriteError::MissingSchema)?,
+                    Some(schema) => {
+                        vec![SyncRecordBatchStream {
+                            data: batches,
+                            schema: schema,
+                        }]
                     }
                 }
             } else {
-                Err(WriteError::MissingData)
-            }?;
+                Err(WriteError::MissingData)?
+            };
             let schema = plan.schema();
             if this.schema_mode == Some(SchemaMode::Merge) && write_new_schema {
                 if let Some(snapshot) = &this.snapshot {
@@ -712,14 +716,6 @@ impl std::future::IntoFuture for WriteBuilder {
                     actions.push(schema_action);
                 }
             }
-            let state = match this.state {
-                Some(state) => state,
-                None => {
-                    let ctx = SessionContext::new();
-                    register_store(this.log_store.clone(), ctx.runtime_env());
-                    ctx.state()
-                }
-            };
 
             let (predicate_str, predicate) = match this.predicate {
                 Some(predicate) => {

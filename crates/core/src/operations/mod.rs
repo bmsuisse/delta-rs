@@ -24,6 +24,7 @@ pub mod optimize;
 pub mod restore;
 pub mod transaction;
 pub mod vacuum;
+mod write_memory;
 
 #[cfg(feature = "datafusion")]
 use self::{
@@ -137,7 +138,7 @@ impl DeltaOps {
     /// Write data to Delta table
     #[cfg(feature = "datafusion")]
     #[must_use]
-    pub fn write(self, batches: impl IntoIterator<Item = RecordBatch>) -> WriteBuilder {
+    pub fn write<I: Iterator<Item = RecordBatch> + Send>(self, batches: I) -> WriteBuilder {
         WriteBuilder::new(self.0.log_store, self.0.state).with_input_batches(batches)
     }
 

@@ -1414,7 +1414,7 @@ fn write_to_deltalake(
         .map_err(PythonError::from)?;
 
     let mut builder = table
-        .write(batches)
+        .write(batches.into_iter())
         .with_schema(schema)
         .with_save_mode(save_mode)
         .with_write_batch_size(max_rows_per_group as usize);
