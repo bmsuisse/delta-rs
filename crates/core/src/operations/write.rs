@@ -34,6 +34,7 @@ use arrow_array::RecordBatch;
 use arrow_cast::can_cast_types;
 use arrow_schema::{ArrowError, DataType, Fields, SchemaRef as ArrowSchemaRef};
 use datafusion::execution::context::{SessionContext, SessionState, TaskContext};
+use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream};
 use datafusion::physical_expr::create_physical_expr;
 use datafusion::physical_plan::filter::FilterExec;
 use datafusion::physical_plan::stream::RecordBatchReceiverStreamBuilder;
@@ -350,24 +351,16 @@ impl WriteBuilder {
 async fn write_execution_plan_with_predicate(
     predicate: Option<Expr>,
     snapshot: Option<&DeltaTableState>,
-    state: SessionState,
-    plan: Arc<dyn ExecutionPlan>,
+   
+    to_write: Vec<SendableRecordBatchStream>,
     partition_columns: Vec<String>,
     object_store: ObjectStoreRef,
     target_file_size: Option<usize>,
     write_batch_size: Option<usize>,
     writer_properties: Option<WriterProperties>,
     safe_cast: bool,
-    schema_mode: Option<SchemaMode>,
+    schema_mode: Option<SchemaMode>
 ) -> DeltaResult<Vec<Action>> {
-    let schema: ArrowSchemaRef = if schema_mode.is_some() {
-        plan.schema()
-    } else {
-        snapshot
-            .and_then(|s| s.input_schema().ok())
-            .unwrap_or(plan.schema())
-    };
-
     let checker = if let Some(snapshot) = snapshot {
         DeltaDataChecker::new(snapshot)
     } else {
@@ -384,22 +377,24 @@ async fn write_execution_plan_with_predicate(
 
     // Write data to disk
     let mut tasks = vec![];
-    for i in 0..plan.output_partitioning().partition_count() {
-        let inner_plan = plan.clone();
-        let inner_schema = schema.clone();
-        let task_ctx = Arc::new(TaskContext::from(&state));
-        let config = WriterConfig::new(
-            inner_schema.clone(),
-            partition_columns.clone(),
-            writer_properties.clone(),
-            target_file_size,
-            write_batch_size,
-        );
-        let mut writer = DeltaWriter::new(object_store.clone(), config);
+    for plan in to_write {
+        let part_cols = partition_columns.clone();
+        let writer_props: Option<WriterProperties> = writer_properties.clone();
+        let object_store = object_store.clone();              
         let checker_stream = checker.clone();
-        let mut stream = inner_plan.execute(i, task_ctx)?;
+
         let handle: tokio::task::JoinHandle<DeltaResult<Vec<Action>>> =
             tokio::task::spawn(async move {
+                let inner_schema = plan.schema().clone();
+                let config = WriterConfig::new(
+                    inner_schema.clone(),
+                    part_cols,
+                    writer_props,
+                    target_file_size,
+                    write_batch_size,
+                );
+                let mut writer = DeltaWriter::new(object_store, config);
+                let mut stream = plan;
                 while let Some(maybe_batch) = stream.next().await {
                     let batch = maybe_batch?;
                     checker_stream.check_batch(&batch).await?;
@@ -437,8 +432,7 @@ async fn write_execution_plan_with_predicate(
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn write_execution_plan(
     snapshot: Option<&DeltaTableState>,
-    state: SessionState,
-    plan: Arc<dyn ExecutionPlan>,
+    to_write: Vec<SendableRecordBatchStream>,
     partition_columns: Vec<String>,
     object_store: ObjectStoreRef,
     target_file_size: Option<usize>,
@@ -450,8 +444,7 @@ pub(crate) async fn write_execution_plan(
     write_execution_plan_with_predicate(
         None,
         snapshot,
-        state,
-        plan,
+        to_write,
         partition_columns,
         object_store,
         target_file_size,
@@ -494,12 +487,17 @@ async fn execute_non_empty_expr(
     )?;
     let filter: Arc<dyn ExecutionPlan> =
         Arc::new(FilterExec::try_new(predicate_expr, scan.clone())?);
-
+    let to_execute :Vec<SendableRecordBatchStream> = Vec::with_capacity(partition_columns.len());
+    for i in 0..partition_columns.len() {
+        let res = filter.execute(0, Arc::new(TaskContext::from(&state)))?;
+        to_execute.push(res);
+    }
+    
+     ;
     // We don't want to verify the predicate against existing data
     let add_actions = write_execution_plan(
         Some(snapshot),
-        state,
-        filter,
+        to_execute,
         partition_columns,
         log_store.object_store(),
         Some(snapshot.table_config().target_file_size() as usize),
@@ -605,56 +603,60 @@ impl std::future::IntoFuture for WriteBuilder {
             } else {
                 Ok(this.partition_columns.unwrap_or_default())
             }?;
-            let mut schema_drift = false;
-            let plan = if let Some(plan) = this.input {
-                if this.schema_mode == Some(SchemaMode::Merge) {
-                    return Err(DeltaTableError::Generic(
-                        "Schema merge not supported yet for Datafusion".to_string(),
-                    ));
+            
+            let input_schema = match this.input {
+                Some(plan) => plan.schema(),
+                None => this.schema.ok_or(WriteError::MissingSchema)?,
+            };
+            let current_schema = match this.snapshot {
+                Some(snapshot) => {
+                    snapshot
+                        .physical_arrow_schema(this.log_store.object_store().clone())
+                        .await
+                        .or_else(|_| snapshot.arrow_schema())?
                 }
+                None => input_schema,
+            };
+            
+            let mut target_schema = current_schema;
+
+            let mut write_new_schema= false;
+            if let Err(schema_err) = try_cast_batch(input_schema.fields(), current_schema.fields())
+            {
+                if this.mode == SaveMode::Overwrite && this.schema_mode.is_some() {
+                    target_schema = input_schema // we overwrite anyway, so no need to cast
+                } else if this.schema_mode == Some(SchemaMode::Merge) {
+                    write_new_schema=true;
+                    target_schema = Arc::new(merge_schema(
+                        current_schema.as_ref().clone(),
+                        input_schema.as_ref().clone(),
+                    )?);
+                } else {
+                    return Err(schema_err.into());
+                }
+            }
+
+            let plan = if let Some(plan) = this.input {
                 Ok(plan)
             } else if let Some(batches) = this.batches {
                 match this.schema {
                     None => Err(WriteError::MissingData),
                     Some(schema) => {
-                        let mut new_schema = None;
-                        if let Some(snapshot) = &this.snapshot {
-                            let table_schema = snapshot
-                                .physical_arrow_schema(this.log_store.object_store().clone())
-                                .await
-                                .or_else(|_| snapshot.arrow_schema())
-                                .unwrap_or(schema.clone());
-
-                            if let Err(schema_err) =
-                                try_cast_batch(schema.fields(), table_schema.fields())
-                            {
-                                schema_drift = true;
-                                if this.mode == SaveMode::Overwrite && this.schema_mode.is_some() {
-                                    new_schema = None // we overwrite anyway, so no need to cast
-                                } else if this.schema_mode == Some(SchemaMode::Merge) {
-                                    new_schema = Some(Arc::new(merge_schema(
-                                        table_schema.as_ref().clone(),
-                                        schema.as_ref().clone(),
-                                    )?));
-                                } else {
-                                    return Err(schema_err.into());
-                                }
-                            }
-                        }
+                        
                         // TODO: create a MemoryExec that can live with an iterator
                         let data = if !partition_columns.is_empty() {
                             // TODO partitioning should probably happen in its own plan ...
                             let mut partitions: HashMap<String, Vec<RecordBatch>> = HashMap::new();
                             for batch in batches {
-                                let real_batch = match new_schema.clone() {
+                                let real_batch = match write_new_schema {
                                     Some(new_schema) => {
-                                        cast_record_batch(&batch, new_schema, false, true)?
+                                        cast_record_batch(&batch, target_schema, false, true)?
                                     }
                                     None => batch,
                                 };
 
                                 let divided = divide_by_partition_values(
-                                    new_schema.clone().unwrap_or(schema.clone()),
+                                    target_schema.clone(),
                                     partition_columns.clone(),
                                     &real_batch,
                                 )?;
@@ -699,7 +701,7 @@ impl std::future::IntoFuture for WriteBuilder {
                 Err(WriteError::MissingData)
             }?;
             let schema = plan.schema();
-            if this.schema_mode == Some(SchemaMode::Merge) && schema_drift {
+            if this.schema_mode == Some(SchemaMode::Merge) && write_new_schema {
                 if let Some(snapshot) = &this.snapshot {
                     let schema_struct: StructType = schema.clone().try_into()?;
                     let schema_action = Action::Metadata(Metadata::try_new(
